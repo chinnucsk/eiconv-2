@@ -19,10 +19,13 @@
 -spec convert(string(), string(), binary()) -> {ok, binary()} | {error, atom()}.
 convert(From, To, String) ->
 	Ref = make_ref(),
-	erlang:port_call(iconv, 1, {Ref, From, To, String}),
-	receive
-		{Ref, Answer} ->
+	case erlang:port_call(iconv, 1, {Ref, From, To, String})
+	of ok ->
+		receive {Ref, Answer} ->
 			Answer
+		end
+	; Error ->
+		Error
 	end.
 
 %% @doc Start iconv driver
