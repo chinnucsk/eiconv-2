@@ -169,12 +169,12 @@ static ErlDrvSSizeT iconv_drv_call(
 	if (ei_decode_binary(buf, &index, task->in, &binarySize)) return -1;
 	task->in_size = binarySize;
 
+	task->receiver = driver_caller(data->port);
+
 	driver_async(data->port, NULL, do_convert, (void *) task, do_clean_convert);
 
 	if (ei_x_new_with_version(&result)) return -1;
 	if (ei_x_encode_atom(&result, "ok")) return -1;
-
-	task->receiver = driver_caller(data->port);
 
 	*rbuf = driver_alloc(sizeof(char) * result.index);
 	memcpy(*rbuf, result.buff, result.index);
