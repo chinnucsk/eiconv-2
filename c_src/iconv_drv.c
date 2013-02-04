@@ -49,6 +49,8 @@ static void do_convert(void *data)
 	iconv_t cd;
 	size_t inleft, outleft;
 	char *in_start, *out_end;
+	int done = 0;
+	size_t ret;
 
 	cd = iconv_open(task->to, task->from);
 	if (cd == (iconv_t) -1) {
@@ -59,23 +61,44 @@ static void do_convert(void *data)
 	in_start = task->in;
 	inleft = task->in_size;
 
-	outleft = 4 * task->in_size;
+	outleft = 2 * task->in_size;
 	task->out = out_end = driver_alloc(sizeof(char) * outleft);
 
-	while (inleft > 0) {
-		if (iconv(cd, &in_start, &inleft, &out_end, &outleft) == (size_t) -1) {
+	while (done != 1) {
+		if (inleft == 0) {
+			// We need write some end for specific charset (UTF7)
+			ret = iconv(cd, NULL, &inleft, &out_end, &outleft);
+			if (ret != -1) {
+				// We successfully convert, end the loop
+				done = 1;
+			}
+		} else {
+			// Convert next part of string
+			ret = iconv(cd, &in_start, &inleft, &out_end, &outleft);
+		}
+		if (ret == (size_t) -1) {
 			if (errno == EILSEQ) {
 				task->out_size = -2;
+				iconv_close(cd);
 				return;
 			} else if (errno == EINVAL) {
 				task->out_size = -3;
+				iconv_close(cd);
 				return;
 			} else if (errno == E2BIG) {
-				task->out_size = -4;
-				return;
+				size_t already_write = out_end - task->out;
+				outleft += 2 * (inleft + 1);
+				task->out = driver_realloc(task->out, already_write + outleft);
+				if (task->out == NULL) {
+					task->out_size = -4;
+					iconv_close(cd);
+					return;
+				}
+				out_end = task->out + already_write;
 			}
 		}
 	}
+	iconv_close(cd);
 
 	task->out_size = out_end - task->out;
 	return;
@@ -89,7 +112,10 @@ static void do_clean_convert(void *data)
 	driver_free(task->from);
 	driver_free(task->to);
 	driver_free(task->in);
-	driver_free(task->out);
+	if(task->out != NULL) {
+		// Can be NULL if driver_realloc return NULL
+		driver_free(task->out);
+	}
 	driver_free(task);
 }
 
@@ -168,7 +194,6 @@ static ErlDrvSSizeT iconv_drv_call(
 	}
 	if (ei_decode_binary(buf, &index, task->in, &binarySize)) return -1;
 	task->in_size = binarySize;
-
 	task->receiver = driver_caller(data->port);
 
 	driver_async(data->port, NULL, do_convert, (void *) task, do_clean_convert);
