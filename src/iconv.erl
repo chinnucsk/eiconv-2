@@ -21,11 +21,13 @@ convert(From, To, String) ->
 	Ref = make_ref(),
 	case erlang:port_call(iconv, 1, {Ref, From, To, String})
 	of ok ->
-		receive {Ref, Answer} ->
-			Answer
+		receive {Ref, {ok, Answer}} ->
+			{ok, Answer}
+		; {Ref, {error, Reason}} ->
+			error(Reason, [From, To, String])
 		end
-	; Error ->
-		Error
+	; {error, Reason} ->
+		error(Reason, [From, To, String])
 	end.
 
 %% @doc Start iconv driver

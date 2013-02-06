@@ -27,8 +27,107 @@ typedef struct {
 	char *out;
 	long out_size;
 	ErlDrvTermData receiver;
-} convert_data;
+} convert_task;
 
+// EI function
+int ei_string_or_binary(const char *buf, int *index, char **string)
+{
+	int type, size;
+	char *temp;
+	long bin_size;
+
+	if (ei_get_type(buf, index, &type, &size)) {
+		return -1;
+	}
+
+	if (type != ERL_STRING_EXT && type != ERL_BINARY_EXT) {
+		return -1;
+	}
+
+	temp = driver_alloc(sizeof(char) * (size + 1));
+	if (temp == NULL) {
+		return -2;
+	}
+
+	if (type == ERL_STRING_EXT) {
+		if (ei_decode_string(buf, index, temp)) {
+			driver_free(temp);
+			return -1;
+		}
+	} else {
+		if (ei_decode_binary(buf, index, temp, &bin_size)) {
+			driver_free(temp);
+			return -1;
+		}
+		temp[bin_size] = 0;
+	}
+
+	*string = temp;
+	return 0;
+}
+
+int ei_binary(const char *buf, int *index, char **binary, long *binary_size)
+{
+	int type, size;
+	char *temp;
+
+	if (ei_get_type(buf, index, &type, &size) || type != ERL_BINARY_EXT) {
+		return -1;
+	}
+
+	temp = driver_alloc(sizeof(char) * size);
+	if (temp == NULL) {
+		return -2;
+	}
+
+	if (ei_decode_binary(buf, index, temp, binary_size)) {
+		driver_free(temp);
+		return -1;
+	}
+
+	*binary = temp;
+	return 0;
+}
+
+// Help function
+static ErlDrvSSizeT answer(const int error, char **rbuf, int len)
+{
+	ei_x_buff result;
+	int size;
+
+	// TODO write to rbuf?
+	if (error == -2) {
+		if (ei_x_new_with_version(&result)
+			|| ei_x_encode_tuple_header(&result, 2)
+			|| ei_x_encode_atom(&result, "error")
+			|| ei_x_encode_atom(&result, "enomem")) {
+			return -1;
+		}
+
+		*rbuf = (char *) driver_alloc(sizeof(char) * result.index);
+		memcpy(*rbuf, result.buff, result.index);
+		size = result.index;
+		ei_x_free(&result);
+
+		return size;
+	} else if (error < 0) {
+		return (ErlDrvSSizeT) ERL_DRV_ERROR_GENERAL;
+	}
+
+	if (ei_x_new_with_version(&result)
+		|| ei_x_encode_atom(&result, "ok")) {
+		return -1;
+	}
+
+	*rbuf = (char *) driver_alloc(sizeof(char) * result.index);
+	memcpy(*rbuf, result.buff, result.index);
+	size = result.index;
+	ei_x_free(&result);
+
+	return size;
+}
+
+// Erlang port
 static ErlDrvData iconv_drv_start(ErlDrvPort port, char *buff)
 {
 	iconv_data *data = (iconv_data *) driver_alloc(sizeof(iconv_data));
@@ -45,7 +144,8 @@ static void iconv_drv_stop(ErlDrvData handle)
 // Do convert
 static void do_convert(void *data)
 {
-	convert_data *task = (convert_data *) data;
+	// TODO write ext binary tem?
+	convert_task *task = (convert_task *) data;
 	iconv_t cd;
 	size_t inleft, outleft;
 	char *in_start, *out_end;
@@ -63,6 +163,11 @@ static void do_convert(void *data)
 
 	outleft = 2 * task->in_size;
 	task->out = out_end = driver_alloc(sizeof(char) * outleft);
+	if (task->out == NULL) {
+		task->out_size = -4;
+		iconv_close(cd);
+		return;
+	}
 
 	while (done != 1) {
 		if (inleft == 0) {
@@ -105,9 +210,9 @@ static void do_convert(void *data)
 }
 
 // Free resource
-static void do_clean_convert(void *data)
+static void do_clean(void *data)
 {
-	convert_data *task = (convert_data *) data;
+	convert_task *task = (convert_task *) data;
 	driver_free(task->ref);
 	driver_free(task->from);
 	driver_free(task->to);
@@ -117,24 +222,6 @@ static void do_clean_convert(void *data)
 		driver_free(task->out);
 	}
 	driver_free(task);
-}
-
-static int answer_enomem(char **rbuf)
-{
-	ei_x_buff result;
-	int size;
-
-	if (ei_x_new_with_version(&result)) return -1;
-	if (ei_x_encode_tuple_header(&result, 2)) return -1;
-	if (ei_x_encode_atom(&result, "error")) return -1;
-	if (ei_x_encode_atom(&result, "enomem")) return -1;
-
-	*rbuf = driver_alloc(sizeof(char) * result.index);
-	memcpy(*rbuf, result.buff, result.index);
-	size = result.index;
-	ei_x_free(&result);
-
-	return size;
 }
 
 // Start convert task
@@ -151,99 +238,94 @@ static ErlDrvSSizeT iconv_drv_call(
 	unsigned int *flags)
 {
 	iconv_data *data = (iconv_data *) port_data;
-	int index = 0, type, size;
-	long binarySize;
-	convert_data *task;
-	ei_x_buff result;
+	convert_task *task;
+	int index = 0, type, ret;
 
-	if (ei_decode_version(buf, &index, &type)) return -1;
+	if (command != 1
+		|| ei_decode_version(buf, &index, &type)
+		// {Ref, From, To, Binary}
+		|| ei_decode_tuple_header(buf, &index, &ret)
+		|| ret != 4) {
+		return answer(-1, rbuf, rlen);
+	}
 
-	// {Ref, From, To, Binary}
-	if (ei_decode_tuple_header(buf, &index, &size) || size != 4) return -1;
-
-	task = driver_alloc(sizeof(convert_data));
+	task = driver_alloc(sizeof(convert_task));
 
 	// Ref
-	task->ref = driver_alloc(sizeof(erlang_ref));
+	task->ref = (erlang_ref *) driver_alloc(sizeof(erlang_ref));
 	if (task->ref == NULL) {
-		return answer_enomem(rbuf);
+		return answer(-2, rbuf, rlen);
 	}
-	if (ei_decode_ref(buf, &index, task->ref)) return -1;
+	if (ei_decode_ref(buf, &index, task->ref)) {
+		driver_free(task);
+		return answer(-1, rbuf, rlen);
+	}
 
 	// From
-	if (ei_get_type(buf, &index, &type, &size)) return -1;
-	task->from = driver_alloc(size + 1);
-	if (task->from == NULL) {
-		return answer_enomem(rbuf);
+	if ((ret = ei_string_or_binary(buf, &index, &task->from))) {
+		driver_free(task->ref);
+		driver_free(task);
+		return answer(ret, rbuf, rlen);
 	}
-	if (ei_decode_string(buf, &index, task->from)) return -1;
 
 	// To
-	if (ei_get_type(buf, &index, &type, &size)) return -1;
-	task->to = driver_alloc(size + 1);
-	if (task->to == NULL) {
-		return answer_enomem(rbuf);
+	if ((ret = ei_string_or_binary(buf, &index, &task->to))) {
+		driver_free(task->ref);
+		driver_free(task->from);
+		driver_free(task);
+		return answer(ret, rbuf, rlen);
 	}
-	ei_decode_string(buf, &index, task->to);
 
 	// Binary
-	if (ei_get_type(buf, &index, &type, &size)) return -1;
-	task->in = driver_alloc(size);
-	if (task->in == NULL) {
-		return answer_enomem(rbuf);
+	if ((ret = ei_binary(buf, &index, &task->in, &task->in_size))) {
+		driver_free(task->ref);
+		driver_free(task->from);
+		driver_free(task->to);
+		driver_free(task);
+		return answer(ret, rbuf, rlen);
 	}
-	if (ei_decode_binary(buf, &index, task->in, &binarySize)) return -1;
-	task->in_size = binarySize;
+
 	task->receiver = driver_caller(data->port);
+	driver_async(data->port, NULL, do_convert, (void *) task, do_clean);
 
-	driver_async(data->port, NULL, do_convert, (void *) task, do_clean_convert);
-
-	if (ei_x_new_with_version(&result)) return -1;
-	if (ei_x_encode_atom(&result, "ok")) return -1;
-
-	*rbuf = driver_alloc(sizeof(char) * result.index);
-	memcpy(*rbuf, result.buff, result.index);
-	size = result.index;
-	ei_x_free(&result);
-
-	return size;
+	return answer(1, rbuf, rlen);
 }
 
 // Send answer to caller
-static void convert_complete(ErlDrvData port_data, ErlDrvThreadData task_data)
+static void answer_ready(ErlDrvData port_data, ErlDrvThreadData task_data)
 {
 	iconv_data *data = (iconv_data *) port_data;
-	convert_data * task = (convert_data*) task_data;
-	ei_x_buff answer;
+	convert_task * task = (convert_task*) task_data;
+	ei_x_buff reply;
 
-	if (ei_x_new_with_version(&answer)) return;
-	if (ei_x_encode_tuple_header(&answer, 2)) return;
-	if (ei_x_encode_ref(&answer, task->ref)) return;
-	if (ei_x_encode_tuple_header(&answer, 2)) return;
+	ei_x_new_with_version(&reply);
+	ei_x_encode_tuple_header(&reply, 2);
+	ei_x_encode_ref(&reply, task->ref);
+	ei_x_encode_tuple_header(&reply, 2);
 
 	if (task->out_size == -1) {
-		if (ei_x_encode_atom(&answer, "error")) return;
-		if (ei_x_encode_atom(&answer, "echarset")) return;
+		ei_x_encode_atom(&reply, "error");
+		ei_x_encode_atom(&reply, "echarset");
 	} else if (task->out_size == -2) {
-		if (ei_x_encode_atom(&answer, "error")) return;
-		if (ei_x_encode_atom(&answer, "eilseq")) return;
+		ei_x_encode_atom(&reply, "error");
+		ei_x_encode_atom(&reply, "eilseq");
 	} else if (task->out_size == -3) {
-		if (ei_x_encode_atom(&answer, "error")) return;
-		if (ei_x_encode_atom(&answer, "einval")) return;
+		ei_x_encode_atom(&reply, "error");
+		ei_x_encode_atom(&reply, "einval");
 	} else if (task->out_size == -4) {
-		if (ei_x_encode_atom(&answer, "error")) return;
-		if (ei_x_encode_atom(&answer, "e2big")) return;
+		ei_x_encode_atom(&reply, "error");
+		ei_x_encode_atom(&reply, "enomeme");
 	} else {
-		if (ei_x_encode_atom(&answer, "ok")) return;
-		if (ei_x_encode_binary(&answer, task->out, task->out_size)) return;
+		ei_x_encode_atom(&reply, "ok");
+		ei_x_encode_binary(&reply, task->out, task->out_size);
 	}
 
 	ErlDrvTermData answer_term[] = {
-		ERL_DRV_EXT2TERM, (ErlDrvTermData) answer.buff, answer.index
+		ERL_DRV_EXT2TERM, (ErlDrvTermData) reply.buff, reply.index
 	};
 	driver_send_term(data->port, task->receiver, answer_term, 3);
 
-	ei_x_free(&answer);
+	ei_x_free(&reply);
 }
 
 ErlDrvEntry iconv_driver_entry = {
@@ -260,7 +342,7 @@ ErlDrvEntry iconv_driver_entry = {
 	NULL,							/* F_PTR timeout, reserved */
 	NULL,							/* F_PTR outputv, reserved */
 	/* Added in Erlang/OTP R15B: */
-	convert_complete,				/* ready_async */
+	answer_ready,					/* ready_async */
 	NULL,							/* flush */
 	iconv_drv_call,					/* call */
 	NULL,							/* event */
